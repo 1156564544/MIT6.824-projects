@@ -7,9 +7,10 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpType    string
+	Key       string
+	Value     string
+	RequestId int
+	ClientId  int64
 }
 
 type KVServer struct {
@@ -35,15 +40,120 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvDB          map[string]string
+	ch            map[int]chan Op // index(raft) -> chan(Op)
+	lastrequestId map[int64]int   // clientId -> last requestId
+
+	lastSSRaftIndex int
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	// Is KVServer is dead?
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// Is the Raft is a leader?
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// request the operation to Raft
+	op := Op{OpType: "Get", Key: args.Key, RequestId: args.RequestId, ClientId: args.ClientId}
+	raftIndex, _, _ := kv.rf.Start(op)
+	// initialize the channel which the operation will be sent to do
+	kv.mu.Lock()
+	waitCh, exist := kv.ch[raftIndex]
+	if !exist {
+		kv.ch[raftIndex] = make(chan Op, 1)
+		waitCh = kv.ch[raftIndex]
+	}
+	kv.mu.Unlock()
+	reply.Err = OK
+	// waite for the operation to be applied
+	select {
+	// receive the channel
+	case op = <-waitCh:
+		if op.RequestId == args.RequestId && op.ClientId == args.ClientId {
+			value, exist := kv.DoGet(op)
+			if exist {
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+				reply.Value = ""
+			}
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	// timeout
+	case <-time.After(time.Duration(consensusTimeout * time.Millisecond)):
+		_, isleader := kv.rf.GetState()
+		if kv.isRequestDuplicated(op.ClientId, op.RequestId) && isleader {
+			value, exist := kv.DoGet(op)
+			if exist {
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+				reply.Value = ""
+			}
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
+	go func() {
+		kv.mu.Lock()
+		delete(kv.ch, raftIndex)
+		kv.mu.Unlock()
+	}()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// Is KVServer is dead?
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// Is the Raft is a leader?
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// request the operation to Raft
+	op := Op{OpType: args.Op, Key: args.Key, Value: args.Value, RequestId: args.RequestId, ClientId: args.ClientId}
+	raftIndex, _, _ := kv.rf.Start(op)
+	// initialize the channel which the operation will be sent to do
+	kv.mu.Lock()
+	waitCh, exist := kv.ch[raftIndex]
+	if !exist {
+		kv.ch[raftIndex] = make(chan Op, 1)
+		waitCh = kv.ch[raftIndex]
+	}
+	kv.mu.Unlock()
+	reply.Err = OK
+	// waite for the operation to be applied
+	select {
+	// receive the channel
+	case op = <-waitCh:
+		if op.RequestId == args.RequestId && op.ClientId == args.ClientId {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	// timeout
+	case <-time.After(time.Duration(consensusTimeout * time.Millisecond)):
+		_, isleader := kv.rf.GetState()
+		if kv.isRequestDuplicated(op.ClientId, op.RequestId) && isleader {
+			reply.Err = OK
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	}
+	go func() {
+		kv.mu.Lock()
+		delete(kv.ch, raftIndex)
+		kv.mu.Unlock()
+	}()
 }
 
 //
@@ -96,6 +206,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvDB = make(map[string]string)
+	kv.ch = make(map[int]chan Op)
+	kv.lastrequestId = make(map[int64]int)
 
+	go kv.waitApplyCh()
 	return kv
 }

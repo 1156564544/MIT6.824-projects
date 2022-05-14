@@ -3,11 +3,14 @@ package kvraft
 import "6.824/labrpc"
 import "crypto/rand"
 import "math/big"
-
+import mathrand "math/rand"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId  int64
+	requestId int
+	leaderId  int
 }
 
 func nrand() int64 {
@@ -21,6 +24,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
+	ck.leaderId = mathrand.Intn(len(servers))
 	return ck
 }
 
@@ -39,7 +45,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	ck.requestId++
+	requestId := ck.requestId
+	server := ck.leaderId
+	args := GetArgs{Key: key, ClientId: ck.clientId, RequestId: requestId}
+
+	for {
+		reply := GetReply{}
+		DPrintf("[Clerk %d] Get %s", ck.clientId, key)
+		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			server = (server + 1) % len(ck.servers)
+			continue
+		}
+		DPrintf("[Clerk %d] Get %s -> %s", ck.clientId, key, reply.Value)
+		if reply.Err == ErrNoKey {
+			return ""
+		}
+		if reply.Err == OK {
+			ck.leaderId = server
+			return reply.Value
+		}
+	}
 }
 
 //
@@ -54,6 +81,24 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.requestId++
+	requestId := ck.requestId
+	server := ck.leaderId
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, RequestId: requestId}
+	for {
+		reply := PutAppendReply{}
+		DPrintf("[Clerk %d] %s %s %s", ck.clientId, op, key, value)
+		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			server = (server + 1) % len(ck.servers)
+			continue
+		}
+		DPrintf("[Clerk %d] %s %s %s -> %s", ck.clientId, op, key, value, reply.Err)
+		if reply.Err == OK {
+			ck.leaderId = server
+			return
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
